@@ -1,6 +1,6 @@
 # Polymarket NegRisk Split Bot
 
-A Python script to mint YES tokens on Polymarket **Negative Risk** markets (Polygon Mainnet) via `NegRiskAdapter`, using either the **Split** or **Convert** strategy.
+A Python script to mint YES tokens on Polymarket **Negative Risk** markets (Polygon Mainnet) via `NegRiskAdapter`, using the **Split**, **Convert**, **Transfer**, or **Balance** strategy.
 
 ---
 
@@ -76,6 +76,14 @@ python polymarket_split.py --strategy convert --amount 1 --dry-run
 python polymarket_split.py --strategy convert --amount 1
 ```
 
+### Strategy: BALANCE — View YES/NO token balances per condition
+
+Check how many YES and NO tokens you hold per condition, with tweet-range labels.
+
+```bash
+python polymarket_split.py --strategy balance
+```
+
 ### Strategy: TRANSFER — Move YES tokens from EOA to Polymarket proxy wallet
 
 After running Convert, transfer tokens to your Polymarket account so they appear in your portfolio.
@@ -86,6 +94,9 @@ python polymarket_split.py --strategy transfer --dry-run
 
 # Live execution (uses TRANSFER_TO from .env)
 python polymarket_split.py --strategy transfer
+
+# Transfer both YES and NO tokens
+python polymarket_split.py --strategy transfer --include-no
 
 # Or specify proxy address directly
 python polymarket_split.py --strategy transfer --transfer-to 0xYourProxyAddress
@@ -114,11 +125,13 @@ python polymarket_split.py --strategy split --amount 5
         ↓
 3. Run convert        →  python polymarket_split.py --strategy convert --amount 1
         ↓
-4. Dry run transfer   →  python polymarket_split.py --strategy transfer --dry-run
+4. Check balances     →  python polymarket_split.py --strategy balance
         ↓
-5. Run transfer       →  python polymarket_split.py --strategy transfer
+5. Dry run transfer   →  python polymarket_split.py --strategy transfer --dry-run
         ↓
-6. Check portfolio    →  polymarket.com/portfolio
+6. Run transfer       →  python polymarket_split.py --strategy transfer
+        ↓
+7. Check portfolio    →  polymarket.com/portfolio
 ```
 
 ---
@@ -127,12 +140,13 @@ python polymarket_split.py --strategy split --amount 5
 
 ```
 --dry-run               Simulate without sending transactions
---strategy  STRING      split | convert | transfer  (default: split)
+--strategy  STRING      split | convert | transfer | balance  (default: split)
 --amount    FLOAT       USDC.e to use (overrides .env SPLIT_AMOUNT_USDC)
 --max       INT         Max conditions to process (overrides .env MAX_CONDITIONS)
 --market-id HEX         NegRisk Market ID (bytes32)
 --slug      STRING      Market slug for Gamma API lookup
 --transfer-to ADDRESS   Proxy wallet address for transfer strategy (overrides .env TRANSFER_TO)
+--include-no            Also transfer NO tokens (transfer strategy only)
 ```
 
 ---
@@ -157,6 +171,16 @@ Result: YES tokens for ALL 30 conditions, cost = 1× amount USDC
 safeBatchTransferFrom(EOA → proxy, [YES_0..YES_29], [amounts])
         ↓
 Tokens appear in Polymarket portfolio
+```
+
+> Use `--include-no` to also transfer NO tokens in the same transaction.
+
+### Balance Strategy (read-only)
+
+```
+balanceOfBatch(EOA, [YES_0..YES_29, NO_0..NO_29])
+        ↓
+Displays per-condition balance with tweet-range label
 ```
 
 ---
@@ -203,7 +227,11 @@ NegRisk Market (1 marketId)
 - `.env` is in `.gitignore` — **never commit it**
 - Private key is read from environment variables only, never hardcoded
 - Always run `--dry-run` before live execution
-- Ensure sufficient MATIC for gas (~0.5 MATIC recommended for all 3 strategies)
+- Ensure sufficient MATIC for gas (~0.5 MATIC recommended for all strategies)
+- `convertPositions` uses a fixed **6M gas limit** (cold storage for 30 CTF positions requires ~4.5M minimum)
+- Minimum gas price enforced at **200 gwei** to avoid stuck transactions on Polygon
+- If `convertPositions` fails mid-way (split already done), re-run safely — the script detects existing NO_0 balance and skips the split step automatically
+- Convert strategy aborts if NegRisk Q0 condition is already resolved — use `--strategy split` for partially resolved markets instead
 
 ---
 

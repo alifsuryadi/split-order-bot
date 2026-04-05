@@ -1141,10 +1141,86 @@ class NegRiskSplitBot:
         log.info("=" * 65)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # CANCEL STRATEGY — batalkan TX pending dengan nonce yang sama
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_cancel_strategy(self, cancel_tx: Optional[str], cancel_nonce: Optional[int]) -> None:
+        """
+        Batalkan TX pending dengan mengirim TX kosong ke diri sendiri
+        menggunakan nonce yang sama + gas 3× lebih tinggi.
+
+        Args:
+            cancel_tx:    TX hash pending yang ingin dibatalkan
+            cancel_nonce: Nonce TX pending (alternatif jika TX hash tidak diketahui)
+        """
+        wallet = self.account.address
+
+        # Cari nonce dari TX hash jika diberikan
+        target_nonce = cancel_nonce
+        if cancel_tx:
+            tx_hash_bytes = cancel_tx if cancel_tx.startswith("0x") else "0x" + cancel_tx
+            log.info(f"[CANCEL] Mencari nonce untuk TX: {tx_hash_bytes[:22]}…")
+            try:
+                pending_tx = self.w3.eth.get_transaction(tx_hash_bytes)
+                target_nonce = pending_tx["nonce"]
+                old_gas = pending_tx.get("gasPrice") or pending_tx.get("maxFeePerGas") or 0
+                log.info(f"[CANCEL] Nonce TX pending : {target_nonce}")
+                log.info(f"[CANCEL] Gas lama         : {Web3.from_wei(old_gas, 'gwei'):.0f} gwei")
+            except Exception as exc:
+                log.error(f"[CANCEL] Tidak bisa baca TX dari RPC: {exc}")
+                log.error("[CANCEL] Coba gunakan --cancel-nonce <N> secara langsung.")
+                sys.exit(1)
+
+        if target_nonce is None:
+            log.error("[CANCEL] Harus berikan --cancel-tx atau --cancel-nonce")
+            sys.exit(1)
+
+        # Gas untuk cancel: 500 gwei minimum (jauh lebih tinggi dari TX stuck)
+        cancel_gas = max(Web3.to_wei("500", "gwei"), self._gas_price() * 3)
+        log.info(f"[CANCEL] Gas cancel      : {Web3.from_wei(cancel_gas, 'gwei'):.0f} gwei")
+
+        log.info("=" * 65)
+        log.info("  CANCEL TX PENDING")
+        log.info("=" * 65)
+        log.info(f"  Wallet : {wallet}")
+        log.info(f"  Nonce  : {target_nonce}")
+        log.info(f"  Gas    : {Web3.from_wei(cancel_gas, 'gwei'):.0f} gwei")
+        log.info(f"  Aksi   : kirim 0 MATIC ke diri sendiri (replace TX stuck)")
+        log.info("=" * 65)
+
+        if self.dry_run:
+            log.info("[DRY-RUN] Simulasi cancel TX (tidak dikirim)")
+            return
+
+        cancel_tx_dict = {
+            "from":     wallet,
+            "to":       wallet,
+            "value":    0,
+            "data":     b"",
+            "gas":      21_000,
+            "gasPrice": cancel_gas,
+            "nonce":    target_nonce,
+            "chainId":  self.CHAIN_ID,
+        }
+
+        tx_hash = self._signed_send(cancel_tx_dict)
+        hex_hash = tx_hash.hex()
+        log.info(f"[CANCEL] TX cancel terkirim!")
+        log.info(f"[CANCEL] TX: https://polygonscan.com/tx/{hex_hash}")
+        log.info("[CANCEL] Menunggu konfirmasi...")
+
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt["status"] == 1:
+            log.info(f"[CANCEL] Berhasil! TX pending dengan nonce {target_nonce} sudah dibatalkan.")
+        else:
+            log.error("[CANCEL] Cancel TX gagal. Cek Polygonscan.")
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ENTRYPOINT UTAMA
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run(self, strategy: str = "split", transfer_to: Optional[str] = None) -> None:
+    def run(self, strategy: str = "split", transfer_to: Optional[str] = None,
+            cancel_tx: Optional[str] = None, cancel_nonce: Optional[int] = None) -> None:
         """
         Jalankan bot.
 
@@ -1152,8 +1228,16 @@ class NegRiskSplitBot:
             strategy:    "split"    → splitPosition × N (dapat YES+NO per kondisi)
                          "convert"  → Split 1 kondisi + convertPositions (YES-only semua)
                          "transfer" → Transfer YES token dari EOA ke proxy wallet
+                         "cancel"   → Batalkan TX pending
             transfer_to: Alamat proxy wallet (hanya untuk strategy "transfer")
+            cancel_tx:   TX hash pending (untuk strategy "cancel")
+            cancel_nonce: Nonce TX pending (untuk strategy "cancel")
         """
+        # ── CANCEL STRATEGY — tidak perlu conditionIds ───────────────────────
+        if strategy == "cancel":
+            self.run_cancel_strategy(cancel_tx=cancel_tx, cancel_nonce=cancel_nonce)
+            return
+
         # 1. Ambil conditionIds + YES token IDs dari Gamma API
         condition_ids = self.fetch_condition_ids()
         condition_ids = condition_ids[:MAX_CONDITIONS]
@@ -1334,7 +1418,10 @@ def _parse_args() -> argparse.Namespace:
             "  python polymarket_split.py --strategy split --amount 5 --max 3\n\n"
             "  # Strategi TRANSFER — pindah YES token dari EOA ke proxy Polymarket\n"
             "  python polymarket_split.py --strategy transfer --transfer-to 0xProxyAddress --dry-run\n"
-            "  python polymarket_split.py --strategy transfer --transfer-to 0xProxyAddress\n"
+            "  python polymarket_split.py --strategy transfer --transfer-to 0xProxyAddress\n\n"
+            "  # Strategi CANCEL — batalkan TX pending yang stuck\n"
+            "  python polymarket_split.py --strategy cancel --cancel-tx 0xTxHash\n"
+            "  python polymarket_split.py --strategy cancel --cancel-nonce 27\n"
         ),
     )
     parser.add_argument(
@@ -1345,14 +1432,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["split", "convert", "transfer"],
+        choices=["split", "convert", "transfer", "cancel"],
         default="split",
         help=(
             "Pilih strategi:\n"
             "  split    = splitPosition × N kondisi → YES+NO per kondisi (N TX)\n"
             "  convert  = split 1 kondisi + convertPositions → YES-only semua kondisi (2 TX)\n"
             "             [DIREKOMENDASIKAN: lebih hemat, avg ~3.4¢ per YES]\n"
-            "  transfer = kirim YES token dari EOA ke proxy wallet Polymarket"
+            "  transfer = kirim YES token dari EOA ke proxy wallet Polymarket\n"
+            "  cancel   = batalkan TX pending (gunakan bersama --cancel-tx atau --cancel-nonce)"
         ),
     )
     parser.add_argument(
@@ -1360,6 +1448,18 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=TRANSFER_TO,
         help="Alamat proxy wallet tujuan (wajib untuk --strategy transfer) [default dari .env TRANSFER_TO]",
+    )
+    parser.add_argument(
+        "--cancel-tx",
+        type=str,
+        default=None,
+        help="TX hash pending yang ingin dibatalkan (untuk --strategy cancel)",
+    )
+    parser.add_argument(
+        "--cancel-nonce",
+        type=int,
+        default=None,
+        help="Nonce TX pending yang ingin dibatalkan (alternatif --cancel-tx)",
     )
     parser.add_argument(
         "--market-id",
@@ -1402,4 +1502,9 @@ if __name__ == "__main__":
     MAX_CONDITIONS = args.max
 
     bot = NegRiskSplitBot(dry_run=args.dry_run)
-    bot.run(strategy=args.strategy, transfer_to=args.transfer_to)
+    bot.run(
+        strategy=args.strategy,
+        transfer_to=args.transfer_to,
+        cancel_tx=args.cancel_tx,
+        cancel_nonce=args.cancel_nonce,
+    )

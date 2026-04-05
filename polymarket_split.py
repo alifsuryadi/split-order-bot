@@ -398,6 +398,22 @@ class GammaClient:
                     token_ids.append(int(ids[0]))  # ids[0] = YES token
         return token_ids
 
+    def extract_all_token_ids_from_event(self, event_data: dict) -> List[int]:
+        """
+        Ekstrak SEMUA token ID (YES dan NO) untuk setiap sub-market.
+        Returns list: [YES_0, NO_0, YES_1, NO_1, ...]
+        """
+        import json as _json
+        sub_markets: list = event_data.get("markets") or event_data.get("children") or []
+        token_ids = []
+        for m in sub_markets:
+            raw = m.get("clobTokenIds")
+            if raw:
+                ids = _json.loads(raw) if isinstance(raw, str) else raw
+                for tid in ids:
+                    token_ids.append(int(tid))
+        return token_ids
+
 
 # =============================================================================
 # SPLIT BOT UTAMA
@@ -523,7 +539,7 @@ class NegRiskSplitBot:
         Ambil gas price dari RPC, pastikan minimal 100 gwei agar tidak stuck di Polygon.
         Minimum 100 gwei = ~$0.003 per TX, cukup untuk konfirmasi cepat.
         """
-        MIN_GWEI = 100
+        MIN_GWEI = 200
         try:
             rpc_wei = self.w3.eth.gas_price
             return max(rpc_wei, Web3.to_wei(MIN_GWEI, "gwei"))
@@ -978,8 +994,58 @@ class NegRiskSplitBot:
         market_bytes = _hex_to_bytes32(market_id_hex)
         amount_raw = int(amount_usdc * 10 ** self.USDC_DECIMALS)
 
-        # indexSet = 0b1 = bit 0 set = user menyediakan NO token untuk condition[0]
-        # Semua kondisi lain (bit unset) = user menerima YES token
+        # ── VALIDASI: pastikan NEG_RISK_MARKET_ID cocok dengan MARKET_SLUG ───
+        log.info("[VALIDASI] Memeriksa kesesuaian NEG_RISK_MARKET_ID dengan MARKET_SLUG...")
+        event_data = self.gamma.get_event_by_slug(MARKET_SLUG)
+        if event_data:
+            api_market_id = (event_data.get("negRiskMarketID") or "").lower().strip()
+            env_market_id = market_id_hex.lower().strip()
+            if api_market_id and api_market_id != env_market_id:
+                log.error("=" * 65)
+                log.error("  ABORT: NEG_RISK_MARKET_ID tidak cocok dengan MARKET_SLUG!")
+                log.error(f"  Dari slug '{MARKET_SLUG}':")
+                log.error(f"    API marketId  : {api_market_id}")
+                log.error(f"    .env marketId : {env_market_id}")
+                log.error("  Perbaiki NEG_RISK_MARKET_ID di .env agar sesuai slug,")
+                log.error("  atau ubah MARKET_SLUG agar sesuai market yang dituju.")
+                log.error("=" * 65)
+                sys.exit(1)
+            else:
+                log.info(f"[VALIDASI] OK — marketId cocok dengan slug '{MARKET_SLUG}'")
+
+        # ── Tentukan condition untuk split menggunakan NegRisk question index 0 ──
+        # PENTING: Jangan gunakan condition_ids[0] dari Gamma API karena urutannya
+        # bisa berbeda dengan NegRisk internal question index.
+        # NegRisk question 0 = conditionId dari questionId dengan last byte = 0x00.
+        # indexSet = 0b1 = bit 0 = user menyediakan NO untuk question 0.
+        log.info("[VALIDASI] Menurunkan NegRisk question index 0 dari marketId...")
+        negrisk_cond_ids = self._derive_condition_ids_from_market_id(market_id_hex, n=n)
+        if not negrisk_cond_ids:
+            log.error("Tidak bisa turunkan conditionId dari marketId!")
+            sys.exit(1)
+        cond_q0 = negrisk_cond_ids[0]  # selalu question index 0 di NegRisk
+        log.info(f"[VALIDASI] NegRisk Q0 conditionId : {cond_q0[:22]}…")
+
+        # Cek apakah question 0 sudah resolved di Gamma API
+        if event_data:
+            sub_mks = event_data.get("markets") or event_data.get("children") or []
+            for _sm in sub_mks:
+                if _sm.get("conditionId", "").lower() == cond_q0.lower():
+                    _closed   = _sm.get("closed", False)
+                    _resolved = _sm.get("resolved", False)
+                    _title    = _sm.get("groupItemTitle") or _sm.get("question") or "?"
+                    if _closed or _resolved:
+                        log.error("=" * 65)
+                        log.error(f"  ABORT: NegRisk question 0 sudah RESOLVED!")
+                        log.error(f"  Kondisi  : {_title}  (closed={_closed}, resolved={_resolved})")
+                        log.error("  Market ini sudah sebagian resolved — convert tidak bisa dilakukan.")
+                        log.error("  Gunakan market baru yang belum ada kondisi resolved.")
+                        log.error("=" * 65)
+                        sys.exit(1)
+                    log.info(f"[VALIDASI] OK — Q0 '{_title}' belum resolved")
+                    break
+
+        # indexSet = 1 (bit 0) → user berikan NO untuk question 0
         index_set = 1
 
         log.info("=" * 65)
@@ -992,16 +1058,45 @@ class NegRiskSplitBot:
         log.info(f"  Total USDC   : {amount_usdc} USDC (bukan {amount_usdc * n}!)")
         log.info("=" * 65)
 
-        # ── Step 1: Split condition_0 → dapat YES_0 + NO_0 ──────────────────
-        cond_0 = condition_ids[0]
-        log.info(f"\n[STEP 1/2] splitPosition(condition_0, {amount_usdc} USDC)")
-        log.info(f"  Condition: {cond_0}")
-        log.info("  Hasil: YES_0 + NO_0 masuk ke wallet")
+        # ── Step 1: Split question 0 (NegRisk-derived) → YES_0 + NO_0 ────────
+        # Gunakan cond_q0 (dari NegRisk derivation), BUKAN condition_ids[0] dari Gamma API.
+        # Ini memastikan NO token yang kita pegang sesuai dengan indexSet=1 di convertPositions.
+        cond_0 = cond_q0
+        skip_split = False
+        if not self.dry_run and event_data:
+            import json as _json
+            sub_markets_ev = event_data.get("markets") or event_data.get("children") or []
+            no0_token_id = None
+            for m in sub_markets_ev:
+                if m.get("conditionId", "").lower() == cond_0.lower():
+                    raw = m.get("clobTokenIds")
+                    if raw:
+                        ids = _json.loads(raw) if isinstance(raw, str) else raw
+                        if len(ids) >= 2:
+                            no0_token_id = int(ids[1])  # ids[1] = NO token
+                    break
+            if no0_token_id is not None:
+                try:
+                    bal = self._rpc_call(
+                        self.ctf.functions.balanceOfBatch,
+                        [self.account.address],
+                        [no0_token_id],
+                    )
+                    if bal and bal[0] >= int(amount_usdc * 10 ** self.USDC_DECIMALS):
+                        skip_split = True
+                        log.info(f"[STEP 1/2] NO_0 sudah ada di wallet ({bal[0]/1e6:.2f} token) — SKIP splitPosition")
+                except Exception:
+                    pass  # Jika gagal cek, tetap lanjut split
 
-        tx1 = self.split_single_condition(cond_0, amount_usdc)
-        if tx1:
-            log.info(f"  TX Split: https://polygonscan.com/tx/{tx1}")
-            time.sleep(3)  # Tunggu TX dikonfirmasi sebelum lanjut
+        if not skip_split:
+            log.info(f"\n[STEP 1/2] splitPosition(condition_0, {amount_usdc} USDC)")
+            log.info(f"  Condition: {cond_0}")
+            log.info("  Hasil: YES_0 + NO_0 masuk ke wallet")
+
+            tx1 = self.split_single_condition(cond_0, amount_usdc)
+            if tx1:
+                log.info(f"  TX Split: https://polygonscan.com/tx/{tx1}")
+                time.sleep(3)  # Tunggu TX dikonfirmasi sebelum lanjut
 
         # ── Step 2: convertPositions → berikan NO_0, dapat YES_1..YES_(N-1) ─
         log.info(f"\n[STEP 2/2] convertPositions(marketId, indexSet={index_set:#010b}, {amount_usdc} USDC)")
@@ -1012,14 +1107,11 @@ class NegRiskSplitBot:
             log.info(f"  [DRY-RUN] convertPositions({market_id_hex[:18]}…, {index_set}, {amount_usdc} USDC)")
         else:
             try:
-                try:
-                    gas_est = self.adapter.functions.convertPositions(
-                        market_bytes, index_set, amount_raw
-                    ).estimate_gas({"from": self.account.address})
-                    gas_limit = int(gas_est * 1.35)
-                except Exception as e_gas:
-                    log.warning(f"  Gas estimasi gagal: {e_gas}. Pakai default 800_000")
-                    gas_limit = 800_000
+                # Gas untuk convertPositions iterasi 30 kondisi:
+                # ~150k gas × 29 splits + overhead ≈ 4.5M minimum.
+                # Pakai 6M untuk margin aman (biaya ~$0.12 di 200 gwei).
+                gas_limit = 6_000_000
+                log.info(f"  Gas limit  : {gas_limit:,} (fixed, tidak pakai estimate)")
 
                 gas_price = self._gas_price()
                 nonce = self._get_nonce()
@@ -1065,14 +1157,15 @@ class NegRiskSplitBot:
     # TRANSFER STRATEGY — kirim YES token dari EOA ke proxy wallet
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run_transfer_strategy(self, yes_token_ids: List[int], proxy_address: str) -> None:
+    def run_transfer_strategy(self, yes_token_ids: List[int], proxy_address: str,
+                               include_no: bool = False) -> None:
         """
-        Transfer semua YES token dari EOA ke proxy wallet Polymarket.
+        Transfer YES token (dan opsional NO token) dari EOA ke proxy wallet Polymarket.
 
-        Steps:
-          1. Cek saldo setiap YES token via balanceOfBatch
-          2. Kumpulkan token yang saldo > 0
-          3. Kirim safeBatchTransferFrom(EOA → proxy, ids, amounts, b'')
+        Args:
+            yes_token_ids: List token ID yang akan dicek dan ditransfer
+            proxy_address: Alamat proxy wallet tujuan
+            include_no:    Jika True, token_ids sudah mencakup YES+NO (dari extract_all_token_ids)
         """
         proxy = Web3.to_checksum_address(proxy_address)
         wallet = self.account.address
@@ -1216,11 +1309,175 @@ class NegRiskSplitBot:
             log.error("[CANCEL] Cancel TX gagal. Cek Polygonscan.")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # BALANCE STRATEGY — tampilkan saldo YES dan NO token di wallet
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_balance_strategy(self, condition_ids: List[str]) -> None:
+        """Tampilkan saldo YES dan NO token untuk semua kondisi di wallet saat ini."""
+        import json as _json
+        wallet = self.account.address
+
+        log.info("=" * 65)
+        log.info("  SALDO TOKEN DI WALLET")
+        log.info("=" * 65)
+        log.info(f"  Wallet : {wallet}")
+        log.info("=" * 65)
+
+        event_data = self.gamma.get_event_by_slug(MARKET_SLUG)
+        if not event_data:
+            log.error(f"Tidak bisa ambil event data untuk slug: {MARKET_SLUG}")
+            sys.exit(1)
+
+        sub_markets = event_data.get("markets") or event_data.get("children") or []
+        token_map: dict = {}
+        title_map: dict = {}
+        for m in sub_markets:
+            cid = m.get("conditionId")
+            raw = m.get("clobTokenIds")
+            if cid and raw:
+                ids = _json.loads(raw) if isinstance(raw, str) else raw
+                if len(ids) >= 2:
+                    token_map[cid] = (int(ids[0]), int(ids[1]))
+                    title_map[cid] = m.get("groupItemTitle") or m.get("question") or cid[:20]
+
+        cids = [c for c in condition_ids if c in token_map]
+        yes_ids = [token_map[c][0] for c in cids]
+        no_ids  = [token_map[c][1] for c in cids]
+
+        accounts_list = [wallet] * len(yes_ids)
+        yes_bals = self._rpc_call(self.ctf.functions.balanceOfBatch, accounts_list, yes_ids)
+        no_bals  = self._rpc_call(self.ctf.functions.balanceOfBatch, accounts_list, no_ids)
+
+        total_yes = total_no = 0
+        for i, cid in enumerate(cids):
+            y, n = yes_bals[i], no_bals[i]
+            if y > 0 or n > 0:
+                label = title_map.get(cid, cid[:20])
+                log.info(f"  [{i:02d}] {label}")
+                if y > 0:
+                    log.info(f"        YES: {y / 1e6:.6f}  (token id: {str(yes_ids[i])[:20]}…)")
+                if n > 0:
+                    log.info(f"        NO : {n / 1e6:.6f}  (token id: {str(no_ids[i])[:20]}…)")
+                total_yes += y
+                total_no  += n
+
+        if total_yes == 0 and total_no == 0:
+            log.info("  (Tidak ada token YES/NO di wallet ini)")
+        else:
+            log.info("─" * 65)
+            log.info(f"  Total YES : {total_yes / 1e6:.6f} USDC")
+            log.info(f"  Total NO  : {total_no  / 1e6:.6f} USDC")
+        log.info("=" * 65)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MERGE STRATEGY — kembalikan YES+NO token ke USDC (kebalikan split)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_merge_strategy(self, condition_ids: List[str]) -> None:
+        """
+        Untuk setiap conditionId: cek saldo YES dan NO token di wallet.
+        Jika keduanya ada, panggil mergePositions(conditionId, min(YES, NO))
+        untuk mendapatkan kembali USDC.e.
+        """
+        wallet = self.account.address
+
+        log.info("=" * 65)
+        log.info("  STRATEGI: MERGE (YES + NO → USDC.e)")
+        log.info("=" * 65)
+
+        # Ambil YES dan NO token IDs dari Gamma API
+        event_data = self.gamma.get_event_by_slug(MARKET_SLUG)
+        if not event_data:
+            log.error(f"Tidak bisa ambil event data untuk slug: {MARKET_SLUG}")
+            sys.exit(1)
+
+        import json as _json
+        sub_markets = event_data.get("markets") or event_data.get("children") or []
+        # Bangun map conditionId → (yes_token_id, no_token_id)
+        token_map: dict = {}
+        for m in sub_markets:
+            cid = m.get("conditionId")
+            raw = m.get("clobTokenIds")
+            if cid and raw:
+                ids = _json.loads(raw) if isinstance(raw, str) else raw
+                if len(ids) >= 2:
+                    token_map[cid] = (int(ids[0]), int(ids[1]))  # YES, NO
+
+        # Cek saldo batch untuk YES dan NO tokens semua kondisi
+        yes_ids = [token_map[c][0] for c in condition_ids if c in token_map]
+        no_ids  = [token_map[c][1] for c in condition_ids if c in token_map]
+        cids_ordered = [c for c in condition_ids if c in token_map]
+
+        if not yes_ids:
+            log.error("Tidak ada token ID ditemukan dari Gamma API.")
+            return
+
+        accounts_list = [wallet] * len(yes_ids)
+        yes_bals = self._rpc_call(self.ctf.functions.balanceOfBatch, accounts_list, yes_ids)
+        no_bals  = self._rpc_call(self.ctf.functions.balanceOfBatch, accounts_list, no_ids)
+
+        # Temukan kondisi dengan YES+NO > 0
+        to_merge = []
+        for i, cid in enumerate(cids_ordered):
+            y, n = yes_bals[i], no_bals[i]
+            if y > 0 and n > 0:
+                amount = min(y, n)
+                to_merge.append((cid, amount))
+                log.info(f"  [{i+1:02d}] {cid[:20]}…  YES={y/1e6:.2f}  NO={n/1e6:.2f}  → merge {amount/1e6:.2f} USDC")
+
+        if not to_merge:
+            log.warning("Tidak ada pasangan YES+NO di wallet — tidak ada yang di-merge.")
+            return
+
+        total_recover = sum(a for _, a in to_merge) / 1e6
+        log.info(f"\n  Total USDC yang akan dikembalikan: {total_recover:.6f} USDC")
+        log.info(f"  Jumlah kondisi: {len(to_merge)}")
+        log.info("=" * 65)
+
+        if self.dry_run:
+            log.info("[DRY-RUN] Simulasi merge (tidak dikirim)")
+            return
+
+        success = 0
+        for idx, (cid, amount_raw) in enumerate(to_merge, 1):
+            cid_bytes = _hex_to_bytes32(cid)
+            log.info(f"\n[MERGE {idx:02d}/{len(to_merge):02d}] {cid[:20]}…  {amount_raw/1e6:.6f} USDC")
+            try:
+                tx = self.adapter.functions.mergePositions(
+                    cid_bytes, amount_raw
+                ).build_transaction({
+                    "from":     wallet,
+                    "chainId":  self.CHAIN_ID,
+                    "gas":      300_000,
+                    "gasPrice": self._gas_price(),
+                    "nonce":    self._get_nonce(),
+                })
+                tx_hash = self._signed_send(tx)
+                log.info(f"  TX: https://polygonscan.com/tx/{tx_hash.hex()}")
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+                if receipt["status"] == 1:
+                    log.info(f"  OK  Gas: {receipt['gasUsed']:,}  → +{amount_raw/1e6:.2f} USDC kembali")
+                    success += 1
+                else:
+                    log.error(f"  GAGAL! Cek TX di Polygonscan.")
+            except Exception as exc:
+                log.error(f"  Error: {exc}")
+
+        log.info("")
+        log.info("=" * 65)
+        log.info("  MERGE SELESAI")
+        log.info("=" * 65)
+        log.info(f"  Berhasil : {success}/{len(to_merge)} kondisi")
+        log.info(f"  USDC dikembalikan: ~{sum(a for _, a in to_merge[:success])/1e6:.2f} USDC")
+        log.info("=" * 65)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ENTRYPOINT UTAMA
     # ─────────────────────────────────────────────────────────────────────────
 
     def run(self, strategy: str = "split", transfer_to: Optional[str] = None,
-            cancel_tx: Optional[str] = None, cancel_nonce: Optional[int] = None) -> None:
+            cancel_tx: Optional[str] = None, cancel_nonce: Optional[int] = None,
+            include_no: bool = False) -> None:
         """
         Jalankan bot.
 
@@ -1249,24 +1506,40 @@ class NegRiskSplitBot:
         # 2. Diagnostik
         self.print_diagnostics(condition_ids)
 
+        if strategy == "balance":
+            # ── BALANCE STRATEGY ─────────────────────────────────────────────
+            self.run_balance_strategy(condition_ids)
+            return
+
+        if strategy == "merge":
+            # ── MERGE STRATEGY ───────────────────────────────────────────────
+            log.info(f"\n[INFO] Strategi MERGE — kembalikan YES+NO → USDC.e")
+            self.run_merge_strategy(condition_ids)
+            return
+
         if strategy == "transfer":
             # ── TRANSFER STRATEGY ────────────────────────────────────────────
             if not transfer_to:
                 log.error("--transfer-to <proxy_address> wajib untuk strategy transfer")
                 sys.exit(1)
-            log.info(f"\n[INFO] Strategi TRANSFER → {transfer_to}")
-            # Ambil YES token IDs dari Gamma API
             event_data = self.gamma.get_event_by_slug(MARKET_SLUG)
             if not event_data:
                 log.error(f"Tidak bisa ambil event data untuk slug: {MARKET_SLUG}")
                 sys.exit(1)
-            yes_token_ids = self.gamma.extract_yes_token_ids_from_event(event_data)
-            yes_token_ids = yes_token_ids[:MAX_CONDITIONS]
-            if not yes_token_ids:
-                log.error("Tidak ada YES token ID ditemukan dari Gamma API")
+            if include_no:
+                log.info(f"\n[INFO] Strategi TRANSFER (YES + NO) → {transfer_to}")
+                token_ids = self.gamma.extract_all_token_ids_from_event(event_data)
+                token_ids = token_ids[:MAX_CONDITIONS * 2]
+                log.info(f"  Ditemukan {len(token_ids)} token ID (YES+NO) dari Gamma API")
+            else:
+                log.info(f"\n[INFO] Strategi TRANSFER (YES only) → {transfer_to}")
+                token_ids = self.gamma.extract_yes_token_ids_from_event(event_data)
+                token_ids = token_ids[:MAX_CONDITIONS]
+                log.info(f"  Ditemukan {len(token_ids)} YES token ID dari Gamma API")
+            if not token_ids:
+                log.error("Tidak ada token ID ditemukan dari Gamma API")
                 sys.exit(1)
-            log.info(f"  Ditemukan {len(yes_token_ids)} YES token ID dari Gamma API")
-            self.run_transfer_strategy(yes_token_ids, transfer_to)
+            self.run_transfer_strategy(token_ids, transfer_to, include_no=include_no)
             return
 
         if strategy == "convert":
@@ -1279,13 +1552,40 @@ class NegRiskSplitBot:
                 f"Total USDC: {total_usdc:.6f} USDC (avg ~{100/len(condition_ids):.1f}¢ per YES)"
             )
 
-            # Validasi saldo
+            # Validasi saldo — hanya jika NO_0 belum ada (split belum terjadi)
+            # Jika NO_0 sudah ada di wallet, berarti split sudah dilakukan sebelumnya
+            # dan kita hanya perlu convertPositions (tidak perlu USDC lagi).
             if not self.dry_run:
-                usdc_raw = self._rpc_call(self.usdc.functions.balanceOf, self.account.address)
-                usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
-                if usdc_bal < total_usdc:
-                    log.error(f"Saldo tidak cukup: {usdc_bal:.2f} USDC (perlu {total_usdc:.2f})")
-                    sys.exit(1)
+                import json as _json
+                _ev = self.gamma.get_event_by_slug(MARKET_SLUG)
+                _no0_exists = False
+                if _ev:
+                    _subs = _ev.get("markets") or _ev.get("children") or []
+                    _cid0 = condition_ids[0] if condition_ids else None
+                    for _m in _subs:
+                        if _m.get("conditionId") == _cid0:
+                            _raw = _m.get("clobTokenIds")
+                            if _raw:
+                                _ids = _json.loads(_raw) if isinstance(_raw, str) else _raw
+                                if len(_ids) >= 2:
+                                    try:
+                                        _bal = self._rpc_call(
+                                            self.ctf.functions.balanceOfBatch,
+                                            [self.account.address], [int(_ids[1])]
+                                        )
+                                        if _bal and _bal[0] >= int(total_usdc * 10 ** self.USDC_DECIMALS):
+                                            _no0_exists = True
+                                    except Exception:
+                                        pass
+                            break
+                if not _no0_exists:
+                    usdc_raw = self._rpc_call(self.usdc.functions.balanceOf, self.account.address)
+                    usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
+                    if usdc_bal < total_usdc:
+                        log.error(f"Saldo tidak cukup: {usdc_bal:.2f} USDC (perlu {total_usdc:.2f})")
+                        sys.exit(1)
+                else:
+                    log.info("[INFO] NO_0 sudah ada — skip validasi saldo USDC")
 
             # Approve USDC.e ke NegRiskAdapter (untuk Step 1: splitPosition)
             self.ensure_usdc_approved(total_usdc_needed=total_usdc * 1.02)
@@ -1432,7 +1732,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["split", "convert", "transfer", "cancel"],
+        choices=["split", "convert", "transfer", "merge", "cancel", "balance"],
         default="split",
         help=(
             "Pilih strategi:\n"
@@ -1440,6 +1740,7 @@ def _parse_args() -> argparse.Namespace:
             "  convert  = split 1 kondisi + convertPositions → YES-only semua kondisi (2 TX)\n"
             "             [DIREKOMENDASIKAN: lebih hemat, avg ~3.4¢ per YES]\n"
             "  transfer = kirim YES token dari EOA ke proxy wallet Polymarket\n"
+            "  merge    = kembalikan YES+NO tokens → USDC.e (recovery modal)\n"
             "  cancel   = batalkan TX pending (gunakan bersama --cancel-tx atau --cancel-nonce)"
         ),
     )
@@ -1489,6 +1790,12 @@ def _parse_args() -> argparse.Namespace:
         default=MAX_CONDITIONS,
         help="Maksimum jumlah kondisi [default: 30]",
     )
+    parser.add_argument(
+        "--include-no",
+        action="store_true",
+        default=False,
+        help="(Untuk --strategy transfer) Transfer YES dan NO token sekaligus",
+    )
     return parser.parse_args()
 
 
@@ -1507,4 +1814,5 @@ if __name__ == "__main__":
         transfer_to=args.transfer_to,
         cancel_tx=args.cancel_tx,
         cancel_nonce=args.cancel_nonce,
+        include_no=args.include_no,
     )

@@ -1,0 +1,16 @@
+# Polymarket NegRisk Split Bot — Dependencies
+# Install: pip install -r requirements.txt
+
+# Web3 & Ethereum interaction
+web3>=6.15.0
+eth-account>=0.11.0
+
+# HTTP requests (Gamma API)
+requests>=2.31.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Optional: Polymarket official Python CLOB client
+# Diperlukan hanya jika ingin menambahkan fitur order management
+# py-clob-client>=0.13.0

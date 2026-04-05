@@ -1,118 +1,118 @@
 # Polymarket NegRisk Split Bot
 
-Script Python untuk melakukan `splitPosition` pada pasar **Negative Risk** Polymarket (Polygon Mainnet) melalui `NegRiskAdapter` — menghindari masalah _"Condition Not Prepared"_ yang muncul saat split langsung di CTF utama.
+A Python script to perform `splitPosition` on Polymarket **Negative Risk** markets (Polygon Mainnet) via `NegRiskAdapter` — bypassing the _"Condition Not Prepared"_ error that occurs when attempting to split directly through the main CTF contract.
 
 ---
 
-## Instalasi
+## Installation
 
-### 1. Buat & aktifkan virtual environment
+### 1. Create & activate virtual environment
 
 ```bash
-# Buat venv (cukup sekali)
+# Create venv (once only)
 python3 -m venv venv
 
-# Aktifkan venv (lakukan setiap buka terminal baru)
+# Activate venv (every time you open a new terminal)
 source venv/bin/activate        # macOS / Linux
 # venv\Scripts\activate         # Windows
 
-# Prompt terminal akan berubah menjadi: (venv) $
+# Your terminal prompt will change to: (venv) $
 ```
 
-### 2. Install dependensi
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Buat file `.env`
+### 3. Create `.env` file
 
 ```bash
 cp .env.example .env
 ```
 
-Buka `.env` dan isi nilai berikut:
+Open `.env` and fill in the following values:
 
-| Variabel | Keterangan |
+| Variable | Description |
 |---|---|
-| `PRIVATE_KEY` | Private key wallet Anda (64 hex chars, dengan atau tanpa `0x`) |
-| `POLYGON_RPC_URL` | URL RPC Polygon — lihat opsi di bawah |
-| `SPLIT_AMOUNT_USDC` | Jumlah USDC.e per kondisi (default: `5`) |
-| `MAX_CONDITIONS` | Batas kondisi yang diproses (default: `30`) |
+| `PRIVATE_KEY` | Your wallet private key (64 hex chars, with or without `0x`) |
+| `POLYGON_RPC_URL` | Polygon RPC URL — see options below |
+| `SPLIT_AMOUNT_USDC` | USDC.e amount per condition (default: `5`) |
+| `MAX_CONDITIONS` | Max conditions to process (default: `30`) |
 
-**Opsi RPC Polygon (pilih salah satu):**
+**Polygon RPC options (choose one):**
 
 ```bash
-# Gratis & stabil (tidak perlu daftar):
+# Free & stable (no registration needed):
 POLYGON_RPC_URL=https://1rpc.io/matic
 
-# Alchemy (lebih andal, perlu daftar di alchemy.com):
-POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/API_KEY_ANDA
+# Alchemy (more reliable, register at alchemy.com):
+POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 ```
 
 ---
 
-## Cara Menjalankan
+## Usage
 
-> **Selalu aktifkan venv dulu** sebelum menjalankan script:
+> **Always activate venv first** before running the script:
 > ```bash
 > source venv/bin/activate
 > ```
 
-### Dry Run (simulasi, tidak ada transaksi nyata)
+### Dry Run (simulation, no real transactions)
 
-Jalankan ini **dulu** sebelum eksekusi nyata untuk memverifikasi konfigurasi:
+Run this **first** before live execution to verify your configuration:
 
 ```bash
 python polymarket_split.py --dry-run
 ```
 
-### Test Kecil (3 kondisi pertama saja)
+### Small Test (first 3 conditions only)
 
 ```bash
 python polymarket_split.py --amount 1 --max 3
 ```
 
-### Eksekusi Penuh (semua 30 kondisi)
+### Full Execution (all 30 conditions)
 
 ```bash
 python polymarket_split.py
 ```
 
-### Semua Opsi CLI
+### All CLI Options
 
 ```
---dry-run          Simulasi tanpa kirim transaksi
---amount  FLOAT    USDC.e per kondisi (override .env)
---max     INT      Batas jumlah kondisi (override .env)
+--dry-run          Simulate without sending transactions
+--amount  FLOAT    USDC.e per condition (overrides .env)
+--max     INT      Max number of conditions (overrides .env)
 --market-id HEX   NegRisk Market ID (bytes32)
---slug    STRING   Slug pasar untuk Gamma API
+--slug    STRING   Market slug for Gamma API lookup
 ```
 
 ---
 
-## Alur Kerja Script
+## How It Works
 
 ```
-1. Fetch conditionId  ←  Gamma API (events?slug=...)
+1. Fetch conditionIds  ←  Gamma API (events?slug=...)
         ↓
-2. Diagnostik         ←  Saldo MATIC, USDC.e, allowance
+2. Diagnostics         ←  MATIC balance, USDC.e balance, allowance
         ↓
-3. Validasi saldo      ←  Pastikan USDC.e mencukupi
+3. Balance check       ←  Ensure sufficient USDC.e
         ↓
-4. Approve USDC.e     →  NegRiskAdapter (sekali, unlimited)
+4. Approve USDC.e      →  NegRiskAdapter (once, unlimited amount)
         ↓
 5. Loop 30x:
    splitPosition(conditionId, amount)  →  NegRiskAdapter
         ↓
-6. Ringkasan hasil + link Polygonscan
+6. Summary + Polygonscan links
 ```
 
 ---
 
-## Penjelasan Arsitektur NegRisk
+## NegRisk Architecture Explained
 
-Pasar NegRisk **bukan** satu kondisi CTF dengan 30 outcome slot. Strukturnya:
+A NegRisk market is **not** a single CTF condition with 30 outcome slots. The structure is:
 
 ```
 NegRisk Market (1 marketId)
@@ -122,15 +122,24 @@ NegRisk Market (1 marketId)
 └─ Question[29] → conditionId[29] → YES token + NO token
 ```
 
-- `getOutcomeSlotCount() = 0` di CTF utama untuk marketId ini adalah **NORMAL**
-- Setiap kondisi di-split secara **terpisah** (30 pemanggilan `splitPosition`)
-- Parameter `partition` pada NegRiskAdapter **diabaikan** — tidak ada single call untuk 30 outcomes sekaligus
+- `getOutcomeSlotCount() = 0` on the main CTF for this marketId is **NORMAL** — not an error
+- Each condition is split **individually** (30 separate `splitPosition` calls)
+- The `partition` parameter on NegRiskAdapter is **ignored** — there is no single call for all 30 outcomes at once
+
+### What you receive after a full split (`SPLIT_AMOUNT_USDC=5`)
+
+| Tokens received | Count |
+|---|---|
+| YES tokens (one per condition) | 150 (5 × 30) |
+| NO tokens (one per condition) | 150 (5 × 30) |
+| **Total tokens** | **300** |
+| **USDC.e spent** | **150 USDC** |
 
 ---
 
-## Kontrak yang Digunakan (Polygon Mainnet)
+## Contract Addresses (Polygon Mainnet)
 
-| Kontrak | Alamat |
+| Contract | Address |
 |---|---|
 | USDC.e | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` |
 | CTF (Conditional Tokens) | `0x4D97dcd97eC945f40cF65F87097ACe5EA0476045` |
@@ -139,9 +148,13 @@ NegRisk Market (1 marketId)
 
 ---
 
-## Keamanan
+## Security
 
-- File `.env` sudah ada di `.gitignore` — **jangan commit**
-- Private key hanya dibaca dari environment variable, tidak pernah hardcode
-- Jalankan `--dry-run` sebelum eksekusi nyata
-- Pastikan saldo MATIC cukup untuk biaya gas (~0.1 MATIC untuk 30 transaksi)
+- `.env` should be in `.gitignore` — **never commit it**
+- Private key is read from environment variables only, never hardcoded
+- Always run `--dry-run` before live execution
+- Ensure sufficient MATIC for gas (~0.1 MATIC for 30 transactions)
+
+---
+
+> Indonesian version: [README-INDO.md](README-INDO.md)

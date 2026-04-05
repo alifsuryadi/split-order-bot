@@ -222,15 +222,71 @@ NEG_RISK_ADAPTER_ABI: list = [
         "outputs": [{"type": "bytes32"}],
         "stateMutability": "view",
     },
+    # ── convertPositions — KUNCI STRATEGI CONVERT ─────────────────────────────
+    # Fungsi ini memungkinkan pertukaran NO tokens → YES tokens lintas kondisi.
+    #
+    # Parameter _indexSet (bitmask):
+    #   Bit SET   = kondisi yang NO token-nya DIBERIKAN oleh user (user memberi NO)
+    #   Bit UNSET = kondisi yang YES token-nya DITERIMA oleh user (user dapat YES)
+    #
+    # Strategi "1 USDC → semua YES":
+    #   Step 1: splitPosition(condition_0) → YES_0 + NO_0   (bayar 1 USDC)
+    #   Step 2: convertPositions(marketId, _indexSet=0b1, amount)
+    #           → user berikan NO_0, terima YES_1..YES_(N-1) (tanpa bayar USDC lagi!)
+    #   Hasil : YES untuk semua N kondisi, avg cost = 1/N USDC per YES ≈ 3.4¢
+    #
+    # PENTING: Sebelum memanggil ini, user harus setApprovalForAll pada CTF
+    # agar NegRiskAdapter boleh menarik NO token dari wallet user.
+    {
+        "name": "convertPositions",
+        "type": "function",
+        "inputs": [
+            {"name": "_marketId",  "type": "bytes32"},
+            {"name": "_indexSet",  "type": "uint256"},  # bitmask NO positions yang disediakan user
+            {"name": "_amount",    "type": "uint256"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    # ── getQuestionCount — jumlah kondisi dalam market ───────────────────────
+    {
+        "name": "getQuestionCount",
+        "type": "function",
+        "inputs": [{"name": "_marketId", "type": "bytes32"}],
+        "outputs": [{"type": "uint256"}],
+        "stateMutability": "view",
+    },
 ]
 
 CTF_ABI: list = [
-    # Hanya untuk diagnostik — cek status kondisi di CTF utama
+    # Diagnostik — cek status kondisi di CTF utama
     {
         "name": "getOutcomeSlotCount",
         "type": "function",
         "inputs": [{"name": "conditionId", "type": "bytes32"}],
         "outputs": [{"type": "uint256"}],
+        "stateMutability": "view",
+    },
+    # Diperlukan untuk convertPositions — izinkan NegRiskAdapter tarik NO token
+    {
+        "name": "setApprovalForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    # Cek apakah NegRiskAdapter sudah diizinkan
+    {
+        "name": "isApprovedForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "account",  "type": "address"},
+            {"name": "operator", "type": "address"},
+        ],
+        "outputs": [{"type": "bool"}],
         "stateMutability": "view",
     },
 ]
@@ -390,6 +446,24 @@ class NegRiskSplitBot:
             sys.exit(1)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RPC HELPER (retry untuk menghindari rate-limit)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _rpc_call(fn, *args, retries: int = 3, delay: float = 1.0):
+        """Panggil fungsi contract dengan retry jika RPC rate-limit / empty response."""
+        import time as _time
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                return fn(*args).call()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    _time.sleep(delay * (attempt + 1))
+        raise last_exc
+
+    # ─────────────────────────────────────────────────────────────────────────
     # DIAGNOSTIK
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -402,7 +476,7 @@ class NegRiskSplitBot:
         log.info(f"  MATIC (gas) : {Web3.from_wei(matic_wei, 'ether'):.6f} MATIC")
 
         # Saldo USDC.e
-        usdc_raw = self.usdc.functions.balanceOf(self.account.address).call()
+        usdc_raw = self._rpc_call(self.usdc.functions.balanceOf, self.account.address)
         usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
         log.info(f"  USDC.e      : {usdc_bal:.6f} USDC")
 
@@ -736,15 +810,187 @@ class NegRiskSplitBot:
         return None  # tidak pernah dicapai
 
     # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # APPROVE CTF (ERC1155) — Diperlukan untuk convertPositions
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def ensure_ctf_approved(self) -> Optional[str]:
+        """
+        Pastikan NegRiskAdapter diizinkan menarik ERC-1155 (NO tokens) dari wallet.
+        Diperlukan sebelum memanggil convertPositions.
+
+        Returns:
+            TX hash jika approval baru dikirim, None jika sudah diizinkan.
+        """
+        operator = Web3.to_checksum_address(ADDR["NEG_RISK_ADAPTER"])
+
+        already_approved = self.ctf.functions.isApprovedForAll(
+            self.account.address, operator
+        ).call()
+
+        if already_approved:
+            log.info("[CTF-APPROVE] NegRiskAdapter sudah diizinkan untuk ERC-1155, skip.")
+            return None
+
+        if self.dry_run:
+            log.info("[DRY-RUN] Simulasi: setApprovalForAll CTF → NegRiskAdapter")
+            return "dry-run-ctf-approve"
+
+        log.info("[CTF-APPROVE] Mengizinkan NegRiskAdapter menarik NO tokens dari CTF...")
+        gas_price = self.w3.eth.gas_price
+        nonce = self.w3.eth.get_transaction_count(self.account.address)
+
+        tx = self.ctf.functions.setApprovalForAll(operator, True).build_transaction({
+            "from":     self.account.address,
+            "nonce":    nonce,
+            "gasPrice": int(gas_price * 1.2),
+            "gas":      80_000,
+            "chainId":  self.CHAIN_ID,
+        })
+
+        signed = self.account.sign_transaction(tx)
+        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info(f"[CTF-APPROVE] TX: https://polygonscan.com/tx/{tx_hash.hex()}")
+
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        if receipt.status != 1:
+            raise RuntimeError(f"setApprovalForAll gagal! TX: {tx_hash.hex()}")
+
+        log.info(f"[CTF-APPROVE] Berhasil! Gas used: {receipt.gasUsed:,}")
+        return tx_hash.hex()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONVERT STRATEGY — Cara paling efisien untuk dapat semua YES token
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_convert_strategy(
+        self,
+        condition_ids: List[str],
+        market_id_hex: str,
+        amount_usdc: float,
+    ) -> None:
+        """
+        Strategi Convert: mendapatkan YES token untuk SEMUA kondisi dengan biaya
+        minimum — hanya 2 transaksi (bukan 30 transaksi seperti strategi Split).
+
+        Mekanisme:
+          Step 1: splitPosition(condition_0, amount)
+                  → Bayar `amount` USDC, dapat YES_0 + NO_0
+          Step 2: convertPositions(marketId, indexSet=0b1, amount)
+                  → Berikan NO_0, dapat YES_1..YES_(N-1) GRATIS
+
+        Hasil:
+          - YES token untuk SEMUA N kondisi di wallet
+          - Total USDC = hanya `amount` USDC (bukan amount × N)
+          - Avg cost per YES = amount / (N × amount) = 1/N ≈ 3.4¢ (30 kondisi)
+
+        Args:
+            condition_ids : List conditionId (condition_0 harus di index [0])
+            market_id_hex : NegRisk Market ID (bytes32 hex)
+            amount_usdc   : Jumlah USDC untuk split awal (= jumlah YES per kondisi)
+        """
+        n = len(condition_ids)
+        avg_cost = 100.0 / n if n > 0 else 0
+        market_bytes = _hex_to_bytes32(market_id_hex)
+        amount_raw = int(amount_usdc * 10 ** self.USDC_DECIMALS)
+
+        # indexSet = 0b1 = bit 0 set = user menyediakan NO token untuk condition[0]
+        # Semua kondisi lain (bit unset) = user menerima YES token
+        index_set = 1
+
+        log.info("=" * 65)
+        log.info("  STRATEGI: CONVERT (1 USDC → YES untuk semua kondisi)")
+        log.info("=" * 65)
+        log.info(f"  Market ID    : {market_id_hex[:18]}…")
+        log.info(f"  Total kondisi: {n}")
+        log.info(f"  Amount/set   : {amount_usdc} USDC.e")
+        log.info(f"  Avg cost YES : ~{avg_cost:.2f}¢ per token")
+        log.info(f"  Total USDC   : {amount_usdc} USDC (bukan {amount_usdc * n}!)")
+        log.info("=" * 65)
+
+        # ── Step 1: Split condition_0 → dapat YES_0 + NO_0 ──────────────────
+        cond_0 = condition_ids[0]
+        log.info(f"\n[STEP 1/2] splitPosition(condition_0, {amount_usdc} USDC)")
+        log.info(f"  Condition: {cond_0}")
+        log.info("  Hasil: YES_0 + NO_0 masuk ke wallet")
+
+        tx1 = self.split_single_condition(cond_0, amount_usdc)
+        if tx1:
+            log.info(f"  TX Split: https://polygonscan.com/tx/{tx1}")
+            time.sleep(3)  # Tunggu TX dikonfirmasi sebelum lanjut
+
+        # ── Step 2: convertPositions → berikan NO_0, dapat YES_1..YES_(N-1) ─
+        log.info(f"\n[STEP 2/2] convertPositions(marketId, indexSet={index_set:#010b}, {amount_usdc} USDC)")
+        log.info(f"  Memberikan : NO_0 untuk condition[0]")
+        log.info(f"  Menerima   : YES untuk {n - 1} kondisi lainnya")
+
+        if self.dry_run:
+            log.info(f"  [DRY-RUN] convertPositions({market_id_hex[:18]}…, {index_set}, {amount_usdc} USDC)")
+        else:
+            try:
+                try:
+                    gas_est = self.adapter.functions.convertPositions(
+                        market_bytes, index_set, amount_raw
+                    ).estimate_gas({"from": self.account.address})
+                    gas_limit = int(gas_est * 1.35)
+                except Exception as e_gas:
+                    log.warning(f"  Gas estimasi gagal: {e_gas}. Pakai default 800_000")
+                    gas_limit = 800_000
+
+                gas_price = self.w3.eth.gas_price
+                nonce = self.w3.eth.get_transaction_count(self.account.address)
+
+                tx2_raw = self.adapter.functions.convertPositions(
+                    market_bytes, index_set, amount_raw
+                ).build_transaction({
+                    "from":     self.account.address,
+                    "nonce":    nonce,
+                    "gasPrice": int(gas_price * 1.2),
+                    "gas":      gas_limit,
+                    "chainId":  self.CHAIN_ID,
+                })
+
+                signed2 = self.account.sign_transaction(tx2_raw)
+                tx2_hash = self.w3.eth.send_raw_transaction(signed2.raw_transaction)
+                log.info(f"  TX Convert: https://polygonscan.com/tx/{tx2_hash.hex()}")
+
+                receipt2 = self.w3.eth.wait_for_transaction_receipt(tx2_hash, timeout=300)
+                if receipt2.status == 1:
+                    log.info(f"  OK  Gas used: {receipt2.gasUsed:,}")
+                else:
+                    raise RuntimeError(
+                        f"convertPositions reverted!\n"
+                        f"  TX: https://polygonscan.com/tx/{tx2_hash.hex()}\n"
+                        f"  Kemungkinan: NO_0 token belum ada di wallet (Step 1 belum selesai),\n"
+                        f"  atau indexSet salah, atau market ID tidak valid."
+                    )
+            except Exception as exc:
+                log.error(f"  [GAGAL] convertPositions: {exc}")
+                raise
+
+        # ── Ringkasan ────────────────────────────────────────────────────────
+        log.info("\n" + "=" * 65)
+        log.info("  HASIL CONVERT STRATEGY")
+        log.info("=" * 65)
+        log.info(f"  YES token di wallet: {n} kondisi × {amount_usdc} token")
+        log.info(f"  Total USDC dipakai : {amount_usdc} USDC")
+        log.info(f"  Avg cost per YES   : {avg_cost:.2f}¢")
+        log.info(f"  Efisiensi vs Split : hemat {(amount_usdc * (n-1)):.1f} USDC!")
+        log.info("=" * 65)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ENTRYPOINT UTAMA
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run(self) -> None:
+    def run(self, strategy: str = "split") -> None:
         """
-        Jalankan proses split lengkap:
-          fetch conditionIds → diagnostik → validasi saldo → approve → split loop
-        """
+        Jalankan bot.
 
+        Args:
+            strategy: "split"   → splitPosition × N (dapat YES+NO per kondisi)
+                      "convert" → Split 1 kondisi + convertPositions (dapat YES-only
+                                  untuk semua kondisi, hemat biaya, avg ~3.4¢)
+        """
         # 1. Ambil conditionIds
         condition_ids = self.fetch_condition_ids()
         condition_ids = condition_ids[:MAX_CONDITIONS]
@@ -753,56 +999,86 @@ class NegRiskSplitBot:
             log.error("Tidak ada conditionId yang ditemukan. Batalkan eksekusi.")
             sys.exit(1)
 
-        total_usdc = SPLIT_AMOUNT_USDC * len(condition_ids)
-        log.info(
-            f"[INFO] {len(condition_ids)} kondisi akan di-split  |  "
-            f"Total USDC diperlukan: {total_usdc:.6f} USDC"
-        )
-
         # 2. Diagnostik
         self.print_diagnostics(condition_ids)
 
-        # 3. Validasi saldo USDC.e
-        if not self.dry_run:
-            usdc_raw = self.usdc.functions.balanceOf(self.account.address).call()
-            usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
-            if usdc_bal < total_usdc:
-                log.error(
-                    f"Saldo USDC.e tidak mencukupi!\n"
-                    f"  Saldo  : {usdc_bal:.6f} USDC\n"
-                    f"  Perlu  : {total_usdc:.6f} USDC\n"
-                    f"  Kurang : {total_usdc - usdc_bal:.6f} USDC\n"
-                    f"  Kurangi SPLIT_AMOUNT_USDC atau MAX_CONDITIONS di .env"
-                )
-                sys.exit(1)
+        if strategy == "convert":
+            # ── CONVERT STRATEGY ────────────────────────────────────────────
+            # Total USDC yang dibutuhkan = HANYA SPLIT_AMOUNT_USDC (bukan × N)
+            total_usdc = SPLIT_AMOUNT_USDC
 
-        # 4. Approve USDC.e ke NegRiskAdapter (satu kali, unlimited)
-        self.ensure_usdc_approved(total_usdc_needed=total_usdc * 1.02)
-
-        # 5. Loop split per kondisi
-        success_list: list = []
-        failed_list: list = []
-
-        for idx, cond_id in enumerate(condition_ids, start=1):
             log.info(
-                f"\n[SPLIT {idx:02d}/{len(condition_ids):02d}] "
-                f"{cond_id[:22]}…  |  {SPLIT_AMOUNT_USDC} USDC.e"
+                f"\n[INFO] Strategi CONVERT — {len(condition_ids)} kondisi  |  "
+                f"Total USDC: {total_usdc:.6f} USDC (avg ~{100/len(condition_ids):.1f}¢ per YES)"
             )
-            try:
-                tx_hash = self.split_single_condition(
-                    condition_id_hex=cond_id,
-                    amount_usdc=SPLIT_AMOUNT_USDC,
-                )
-                success_list.append({"condition_id": cond_id, "tx": tx_hash})
-                # Jeda kecil antar transaksi untuk menghindari nonce collision
-                if not self.dry_run:
-                    time.sleep(2)
-            except Exception as exc:
-                log.error(f"  GAGAL: {exc}")
-                failed_list.append({"condition_id": cond_id, "error": str(exc)})
 
-        # 6. Ringkasan
-        _print_summary(condition_ids, success_list, failed_list)
+            # Validasi saldo
+            if not self.dry_run:
+                usdc_raw = self._rpc_call(self.usdc.functions.balanceOf, self.account.address)
+                usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
+                if usdc_bal < total_usdc:
+                    log.error(f"Saldo tidak cukup: {usdc_bal:.2f} USDC (perlu {total_usdc:.2f})")
+                    sys.exit(1)
+
+            # Approve USDC.e ke NegRiskAdapter (untuk Step 1: splitPosition)
+            self.ensure_usdc_approved(total_usdc_needed=total_usdc * 1.02)
+            # Approve CTF ERC-1155 ke NegRiskAdapter (untuk Step 2: convertPositions)
+            self.ensure_ctf_approved()
+
+            # Jalankan strategi convert
+            self.run_convert_strategy(
+                condition_ids=condition_ids,
+                market_id_hex=NEG_RISK_MARKET_ID,
+                amount_usdc=SPLIT_AMOUNT_USDC,
+            )
+
+        else:
+            # ── SPLIT STRATEGY (default) ─────────────────────────────────────
+            # Total USDC = SPLIT_AMOUNT_USDC × jumlah kondisi
+            total_usdc = SPLIT_AMOUNT_USDC * len(condition_ids)
+            log.info(
+                f"\n[INFO] Strategi SPLIT — {len(condition_ids)} kondisi  |  "
+                f"Total USDC: {total_usdc:.6f} USDC"
+            )
+
+            # Validasi saldo
+            if not self.dry_run:
+                usdc_raw = self._rpc_call(self.usdc.functions.balanceOf, self.account.address)
+                usdc_bal = usdc_raw / 10 ** self.USDC_DECIMALS
+                if usdc_bal < total_usdc:
+                    log.error(
+                        f"Saldo USDC.e tidak mencukupi!\n"
+                        f"  Saldo  : {usdc_bal:.6f} USDC\n"
+                        f"  Perlu  : {total_usdc:.6f} USDC\n"
+                        f"  Kurangi SPLIT_AMOUNT_USDC atau MAX_CONDITIONS di .env"
+                    )
+                    sys.exit(1)
+
+            # Approve USDC.e ke NegRiskAdapter
+            self.ensure_usdc_approved(total_usdc_needed=total_usdc * 1.02)
+
+            # Loop split per kondisi
+            success_list: list = []
+            failed_list: list = []
+
+            for idx, cond_id in enumerate(condition_ids, start=1):
+                log.info(
+                    f"\n[SPLIT {idx:02d}/{len(condition_ids):02d}] "
+                    f"{cond_id[:22]}…  |  {SPLIT_AMOUNT_USDC} USDC.e"
+                )
+                try:
+                    tx_hash = self.split_single_condition(
+                        condition_id_hex=cond_id,
+                        amount_usdc=SPLIT_AMOUNT_USDC,
+                    )
+                    success_list.append({"condition_id": cond_id, "tx": tx_hash})
+                    if not self.dry_run:
+                        time.sleep(2)
+                except Exception as exc:
+                    log.error(f"  GAGAL: {exc}")
+                    failed_list.append({"condition_id": cond_id, "error": str(exc)})
+
+            _print_summary(condition_ids, success_list, failed_list)
 
 
 # =============================================================================
@@ -862,19 +1138,35 @@ def _print_summary(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Polymarket Negative Risk Split Position Bot",
+        description="Polymarket Negative Risk Split Bot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Contoh:\n"
-            "  python polymarket_split.py --dry-run\n"
-            "  python polymarket_split.py --amount 10 --max 5\n"
-            "  python polymarket_split.py --market-id 0x11ab... --slug elon-musk-...\n"
+            "  # Dry run (simulasi)\n"
+            "  python polymarket_split.py --dry-run\n\n"
+            "  # Strategi CONVERT (DIREKOMENDASIKAN) — 2 TX, avg ~3.4¢ per YES\n"
+            "  python polymarket_split.py --strategy convert --amount 8000 --dry-run\n"
+            "  python polymarket_split.py --strategy convert --amount 8000\n\n"
+            "  # Strategi SPLIT (lama) — N TX, dapat YES+NO per kondisi\n"
+            "  python polymarket_split.py --strategy split --amount 5 --max 3\n"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulasi tanpa mengirim transaksi ke blockchain",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["split", "convert"],
+        default="split",
+        help=(
+            "Pilih strategi:\n"
+            "  split   = splitPosition × N kondisi → YES+NO per kondisi (N TX)\n"
+            "  convert = split 1 kondisi + convertPositions → YES-only semua kondisi (2 TX)\n"
+            "            [DIREKOMENDASIKAN: lebih hemat, avg ~3.4¢ per YES]"
+        ),
     )
     parser.add_argument(
         "--market-id",
@@ -892,13 +1184,17 @@ def _parse_args() -> argparse.Namespace:
         "--amount",
         type=float,
         default=SPLIT_AMOUNT_USDC,
-        help="Jumlah USDC.e per kondisi [default dari .env atau 5]",
+        help=(
+            "Jumlah USDC.e:\n"
+            "  --strategy split  : USDC per kondisi (total = amount × N)\n"
+            "  --strategy convert: USDC total untuk 1 complete set (mis: 8000)"
+        ),
     )
     parser.add_argument(
         "--max",
         type=int,
         default=MAX_CONDITIONS,
-        help="Maksimum jumlah kondisi yang di-split [default: 30]",
+        help="Maksimum jumlah kondisi [default: 30]",
     )
     return parser.parse_args()
 
@@ -913,4 +1209,4 @@ if __name__ == "__main__":
     MAX_CONDITIONS = args.max
 
     bot = NegRiskSplitBot(dry_run=args.dry_run)
-    bot.run()
+    bot.run(strategy=args.strategy)

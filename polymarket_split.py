@@ -107,6 +107,8 @@ MARKET_SLUG: str = os.getenv(
     "MARKET_SLUG",
     "elon-musk-of-tweets-april-7-april-14",
 )
+# Alamat proxy wallet Polymarket (tujuan transfer YES token).
+TRANSFER_TO: Optional[str] = os.getenv("TRANSFER_TO") or None
 
 
 # =============================================================================
@@ -289,6 +291,31 @@ CTF_ABI: list = [
         "outputs": [{"type": "bool"}],
         "stateMutability": "view",
     },
+    # Cek saldo ERC-1155 batch
+    {
+        "name": "balanceOfBatch",
+        "type": "function",
+        "inputs": [
+            {"name": "accounts", "type": "address[]"},
+            {"name": "ids",      "type": "uint256[]"},
+        ],
+        "outputs": [{"type": "uint256[]"}],
+        "stateMutability": "view",
+    },
+    # Transfer batch ERC-1155 ke alamat lain
+    {
+        "name": "safeBatchTransferFrom",
+        "type": "function",
+        "inputs": [
+            {"name": "from",   "type": "address"},
+            {"name": "to",     "type": "address"},
+            {"name": "ids",    "type": "uint256[]"},
+            {"name": "amounts","type": "uint256[]"},
+            {"name": "data",   "type": "bytes"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
 ]
 
 
@@ -354,6 +381,22 @@ class GammaClient:
         sub_markets: list = event_data.get("markets") or event_data.get("children") or []
         ids = [m["conditionId"] for m in sub_markets if m.get("conditionId")]
         return ids
+
+    def extract_yes_token_ids_from_event(self, event_data: dict) -> List[int]:
+        """
+        Ekstrak YES token ID (clobTokenIds[0]) untuk setiap sub-market.
+        Returns list of token IDs as integers (ERC-1155 token IDs on CTF).
+        """
+        import json as _json
+        sub_markets: list = event_data.get("markets") or event_data.get("children") or []
+        token_ids = []
+        for m in sub_markets:
+            raw = m.get("clobTokenIds")
+            if raw:
+                ids = _json.loads(raw) if isinstance(raw, str) else raw
+                if ids:
+                    token_ids.append(int(ids[0]))  # ids[0] = YES token
+        return token_ids
 
 
 # =============================================================================
@@ -463,6 +506,49 @@ class NegRiskSplitBot:
                     _time.sleep(delay * (attempt + 1))
         raise last_exc
 
+    def _get_nonce(self) -> int:
+        """Ambil nonce wallet — coba pending lalu latest, ambil nilai tertinggi."""
+        best = 0
+        for blk in ("pending", "latest"):
+            try:
+                n = self.w3.eth.get_transaction_count(self.account.address, blk)
+                if n > best:
+                    best = n
+            except Exception:
+                pass
+        return best
+
+    def _gas_price(self) -> int:
+        """
+        Ambil gas price dari RPC, pastikan minimal 100 gwei agar tidak stuck di Polygon.
+        Minimum 100 gwei = ~$0.003 per TX, cukup untuk konfirmasi cepat.
+        """
+        MIN_GWEI = 100
+        try:
+            rpc_wei = self.w3.eth.gas_price
+            return max(rpc_wei, Web3.to_wei(MIN_GWEI, "gwei"))
+        except Exception:
+            return Web3.to_wei(MIN_GWEI, "gwei")
+
+    def _signed_send(self, tx: dict) -> bytes:
+        """
+        Sign dan kirim TX. Jika RPC menolak karena 'nonce too low',
+        baca nonce yang benar dari pesan error dan retry sekali.
+        """
+        import re
+        signed = self.account.sign_transaction(tx)
+        try:
+            return self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as exc:
+            m = re.search(r"next nonce (\d+)", str(exc))
+            if m:
+                correct = int(m.group(1))
+                log.warning(f"  Nonce koreksi: {tx['nonce']} → {correct}")
+                tx["nonce"] = correct
+                signed2 = self.account.sign_transaction(tx)
+                return self.w3.eth.send_raw_transaction(signed2.raw_transaction)
+            raise
+
     # ─────────────────────────────────────────────────────────────────────────
     # DIAGNOSTIK
     # ─────────────────────────────────────────────────────────────────────────
@@ -481,10 +567,11 @@ class NegRiskSplitBot:
         log.info(f"  USDC.e      : {usdc_bal:.6f} USDC")
 
         # Allowance USDC.e → NegRiskAdapter
-        allowance_raw = self.usdc.functions.allowance(
+        allowance_raw = self._rpc_call(
+            self.usdc.functions.allowance,
             self.account.address,
             Web3.to_checksum_address(ADDR["NEG_RISK_ADAPTER"]),
-        ).call()
+        )
         log.info(
             f"  Allowance   : {allowance_raw / 10**self.USDC_DECIMALS:.6f} USDC"
             f" → NegRiskAdapter"
@@ -495,7 +582,7 @@ class NegRiskSplitBot:
         for cid in condition_ids[:3]:
             cid_bytes = _hex_to_bytes32(cid)
             try:
-                slot_count = self.ctf.functions.getOutcomeSlotCount(cid_bytes).call()
+                slot_count = self._rpc_call(self.ctf.functions.getOutcomeSlotCount, cid_bytes)
             except Exception:
                 slot_count = "error"
             marker = "✓ NegRisk" if slot_count == 0 else f"!! slotCount={slot_count}"
@@ -664,27 +751,26 @@ class NegRiskSplitBot:
             return "dry-run-approve"
 
         MAX_UINT256 = 2**256 - 1  # Approve "unlimited" agar tidak perlu approve berulang
-        gas_price = self.w3.eth.gas_price
-        nonce = self.w3.eth.get_transaction_count(self.account.address)
+        gas_price = self._gas_price()
+        nonce = self._get_nonce()
 
         tx = self.usdc.functions.approve(spender, MAX_UINT256).build_transaction(
             {
                 "from": self.account.address,
                 "nonce": nonce,
-                "gasPrice": int(gas_price * 1.2),  # +20% buffer agar tidak stuck
+                "gasPrice": gas_price,  # +20% buffer agar tidak stuck
                 "gas": 80_000,
                 "chainId": self.CHAIN_ID,
             }
         )
 
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = self._signed_send(tx)
 
         log.info(f"[APPROVE] TX terkirim  : {tx_hash.hex()}")
         log.info(f"[APPROVE] Polygonscan  : https://polygonscan.com/tx/{tx_hash.hex()}")
         log.info("[APPROVE] Menunggu konfirmasi...")
 
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
         if receipt.status != 1:
             raise RuntimeError(
                 f"Transaksi Approve GAGAL (status=0)!\n"
@@ -754,8 +840,8 @@ class NegRiskSplitBot:
                     gas_limit = 450_000
 
                 # ── Build & kirim transaksi ───────────────────────────────────
-                gas_price = self.w3.eth.gas_price
-                nonce = self.w3.eth.get_transaction_count(self.account.address)
+                gas_price = self._gas_price()
+                nonce = self._get_nonce()
 
                 tx = self.adapter.functions["splitPosition(bytes32,uint256)"](
                     cond_bytes, amount_raw
@@ -763,14 +849,13 @@ class NegRiskSplitBot:
                     {
                         "from": self.account.address,
                         "nonce": nonce,
-                        "gasPrice": int(gas_price * 1.2),
+                        "gasPrice": gas_price,
                         "gas": gas_limit,
                         "chainId": self.CHAIN_ID,
                     }
                 )
 
-                signed = self.account.sign_transaction(tx)
-                tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash = self._signed_send(tx)
 
                 log.info(f"  TX: https://polygonscan.com/tx/{tx_hash.hex()}")
 
@@ -837,22 +922,21 @@ class NegRiskSplitBot:
             return "dry-run-ctf-approve"
 
         log.info("[CTF-APPROVE] Mengizinkan NegRiskAdapter menarik NO tokens dari CTF...")
-        gas_price = self.w3.eth.gas_price
-        nonce = self.w3.eth.get_transaction_count(self.account.address)
+        gas_price = self._gas_price()
+        nonce = self._get_nonce()
 
         tx = self.ctf.functions.setApprovalForAll(operator, True).build_transaction({
             "from":     self.account.address,
             "nonce":    nonce,
-            "gasPrice": int(gas_price * 1.2),
+            "gasPrice": gas_price,
             "gas":      80_000,
             "chainId":  self.CHAIN_ID,
         })
 
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = self._signed_send(tx)
         log.info(f"[CTF-APPROVE] TX: https://polygonscan.com/tx/{tx_hash.hex()}")
 
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
         if receipt.status != 1:
             raise RuntimeError(f"setApprovalForAll gagal! TX: {tx_hash.hex()}")
 
@@ -937,24 +1021,23 @@ class NegRiskSplitBot:
                     log.warning(f"  Gas estimasi gagal: {e_gas}. Pakai default 800_000")
                     gas_limit = 800_000
 
-                gas_price = self.w3.eth.gas_price
-                nonce = self.w3.eth.get_transaction_count(self.account.address)
+                gas_price = self._gas_price()
+                nonce = self._get_nonce()
 
                 tx2_raw = self.adapter.functions.convertPositions(
                     market_bytes, index_set, amount_raw
                 ).build_transaction({
                     "from":     self.account.address,
                     "nonce":    nonce,
-                    "gasPrice": int(gas_price * 1.2),
+                    "gasPrice": gas_price,
                     "gas":      gas_limit,
                     "chainId":  self.CHAIN_ID,
                 })
 
-                signed2 = self.account.sign_transaction(tx2_raw)
-                tx2_hash = self.w3.eth.send_raw_transaction(signed2.raw_transaction)
+                tx2_hash = self._signed_send(tx2_raw)
                 log.info(f"  TX Convert: https://polygonscan.com/tx/{tx2_hash.hex()}")
 
-                receipt2 = self.w3.eth.wait_for_transaction_receipt(tx2_hash, timeout=300)
+                receipt2 = self.w3.eth.wait_for_transaction_receipt(tx2_hash, timeout=600)
                 if receipt2.status == 1:
                     log.info(f"  OK  Gas used: {receipt2.gasUsed:,}")
                 else:
@@ -979,19 +1062,99 @@ class NegRiskSplitBot:
         log.info("=" * 65)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # TRANSFER STRATEGY — kirim YES token dari EOA ke proxy wallet
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_transfer_strategy(self, yes_token_ids: List[int], proxy_address: str) -> None:
+        """
+        Transfer semua YES token dari EOA ke proxy wallet Polymarket.
+
+        Steps:
+          1. Cek saldo setiap YES token via balanceOfBatch
+          2. Kumpulkan token yang saldo > 0
+          3. Kirim safeBatchTransferFrom(EOA → proxy, ids, amounts, b'')
+        """
+        proxy = Web3.to_checksum_address(proxy_address)
+        wallet = self.account.address
+        n = len(yes_token_ids)
+
+        log.info("=" * 65)
+        log.info("  STRATEGI: TRANSFER YES TOKEN → PROXY WALLET")
+        log.info("=" * 65)
+        log.info(f"  Dari (EOA)   : {wallet}")
+        log.info(f"  Ke (Proxy)   : {proxy}")
+        log.info(f"  Total token  : {n}")
+        log.info("=" * 65)
+
+        # Cek saldo batch
+        log.info("[STEP 1/2] Cek saldo YES token di EOA...")
+        accounts = [wallet] * n
+        balances = self._rpc_call(
+            self.ctf.functions.balanceOfBatch, accounts, yes_token_ids
+        )
+
+        ids_to_send    = [yes_token_ids[i] for i, b in enumerate(balances) if b > 0]
+        amounts_to_send = [b for b in balances if b > 0]
+
+        if not ids_to_send:
+            log.warning("Tidak ada YES token di EOA — tidak ada yang ditransfer.")
+            return
+
+        log.info(f"  Ditemukan {len(ids_to_send)} dari {n} YES token dengan saldo > 0")
+        for tid, amt in zip(ids_to_send, amounts_to_send):
+            log.info(f"    Token {str(tid)[:20]}…  saldo: {amt / 10**6:.6f}")
+
+        # Transfer
+        log.info(f"\n[STEP 2/2] safeBatchTransferFrom → {proxy[:22]}…")
+
+        if self.dry_run:
+            log.info("[DRY-RUN] Simulasi: safeBatchTransferFrom (tidak dikirim)")
+            return
+
+        tx = self.ctf.functions.safeBatchTransferFrom(
+            wallet, proxy, ids_to_send, amounts_to_send, b""
+        ).build_transaction({
+            "from":     wallet,
+            "chainId":  self.CHAIN_ID,
+            "gas":      500_000 + 30_000 * len(ids_to_send),
+            "maxFeePerGas":         Web3.to_wei("200", "gwei"),
+            "maxPriorityFeePerGas": Web3.to_wei("100", "gwei"),
+            "nonce": self._get_nonce(),
+        })
+        tx_hash = self._signed_send(tx)
+        hex_hash = tx_hash.hex()
+        log.info(f"  TX: https://polygonscan.com/tx/{hex_hash}")
+        log.info("  Menunggu konfirmasi...")
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        if receipt["status"] == 1:
+            log.info(f"  OK  Gas used: {receipt['gasUsed']:,}")
+        else:
+            log.error("  Transfer GAGAL! Cek TX di Polygonscan.")
+            return
+
+        log.info("")
+        log.info("=" * 65)
+        log.info("  TRANSFER SELESAI")
+        log.info("=" * 65)
+        log.info(f"  {len(ids_to_send)} YES token dikirim ke proxy wallet")
+        log.info(f"  Cek porto: https://polymarket.com/portfolio")
+        log.info("=" * 65)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ENTRYPOINT UTAMA
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run(self, strategy: str = "split") -> None:
+    def run(self, strategy: str = "split", transfer_to: Optional[str] = None) -> None:
         """
         Jalankan bot.
 
         Args:
-            strategy: "split"   → splitPosition × N (dapat YES+NO per kondisi)
-                      "convert" → Split 1 kondisi + convertPositions (dapat YES-only
-                                  untuk semua kondisi, hemat biaya, avg ~3.4¢)
+            strategy:    "split"    → splitPosition × N (dapat YES+NO per kondisi)
+                         "convert"  → Split 1 kondisi + convertPositions (YES-only semua)
+                         "transfer" → Transfer YES token dari EOA ke proxy wallet
+            transfer_to: Alamat proxy wallet (hanya untuk strategy "transfer")
         """
-        # 1. Ambil conditionIds
+        # 1. Ambil conditionIds + YES token IDs dari Gamma API
         condition_ids = self.fetch_condition_ids()
         condition_ids = condition_ids[:MAX_CONDITIONS]
 
@@ -1001,6 +1164,26 @@ class NegRiskSplitBot:
 
         # 2. Diagnostik
         self.print_diagnostics(condition_ids)
+
+        if strategy == "transfer":
+            # ── TRANSFER STRATEGY ────────────────────────────────────────────
+            if not transfer_to:
+                log.error("--transfer-to <proxy_address> wajib untuk strategy transfer")
+                sys.exit(1)
+            log.info(f"\n[INFO] Strategi TRANSFER → {transfer_to}")
+            # Ambil YES token IDs dari Gamma API
+            event_data = self.gamma.get_event_by_slug(MARKET_SLUG)
+            if not event_data:
+                log.error(f"Tidak bisa ambil event data untuk slug: {MARKET_SLUG}")
+                sys.exit(1)
+            yes_token_ids = self.gamma.extract_yes_token_ids_from_event(event_data)
+            yes_token_ids = yes_token_ids[:MAX_CONDITIONS]
+            if not yes_token_ids:
+                log.error("Tidak ada YES token ID ditemukan dari Gamma API")
+                sys.exit(1)
+            log.info(f"  Ditemukan {len(yes_token_ids)} YES token ID dari Gamma API")
+            self.run_transfer_strategy(yes_token_ids, transfer_to)
+            return
 
         if strategy == "convert":
             # ── CONVERT STRATEGY ────────────────────────────────────────────
@@ -1148,7 +1331,10 @@ def _parse_args() -> argparse.Namespace:
             "  python polymarket_split.py --strategy convert --amount 8000 --dry-run\n"
             "  python polymarket_split.py --strategy convert --amount 8000\n\n"
             "  # Strategi SPLIT (lama) — N TX, dapat YES+NO per kondisi\n"
-            "  python polymarket_split.py --strategy split --amount 5 --max 3\n"
+            "  python polymarket_split.py --strategy split --amount 5 --max 3\n\n"
+            "  # Strategi TRANSFER — pindah YES token dari EOA ke proxy Polymarket\n"
+            "  python polymarket_split.py --strategy transfer --transfer-to 0xProxyAddress --dry-run\n"
+            "  python polymarket_split.py --strategy transfer --transfer-to 0xProxyAddress\n"
         ),
     )
     parser.add_argument(
@@ -1159,14 +1345,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["split", "convert"],
+        choices=["split", "convert", "transfer"],
         default="split",
         help=(
             "Pilih strategi:\n"
-            "  split   = splitPosition × N kondisi → YES+NO per kondisi (N TX)\n"
-            "  convert = split 1 kondisi + convertPositions → YES-only semua kondisi (2 TX)\n"
-            "            [DIREKOMENDASIKAN: lebih hemat, avg ~3.4¢ per YES]"
+            "  split    = splitPosition × N kondisi → YES+NO per kondisi (N TX)\n"
+            "  convert  = split 1 kondisi + convertPositions → YES-only semua kondisi (2 TX)\n"
+            "             [DIREKOMENDASIKAN: lebih hemat, avg ~3.4¢ per YES]\n"
+            "  transfer = kirim YES token dari EOA ke proxy wallet Polymarket"
         ),
+    )
+    parser.add_argument(
+        "--transfer-to",
+        type=str,
+        default=TRANSFER_TO,
+        help="Alamat proxy wallet tujuan (wajib untuk --strategy transfer) [default dari .env TRANSFER_TO]",
     )
     parser.add_argument(
         "--market-id",
@@ -1209,4 +1402,4 @@ if __name__ == "__main__":
     MAX_CONDITIONS = args.max
 
     bot = NegRiskSplitBot(dry_run=args.dry_run)
-    bot.run(strategy=args.strategy)
+    bot.run(strategy=args.strategy, transfer_to=args.transfer_to)

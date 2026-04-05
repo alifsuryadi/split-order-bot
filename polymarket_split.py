@@ -661,7 +661,7 @@ class NegRiskSplitBot:
             "[FALLBACK] Gamma API tidak mengembalikan conditionId. "
             "Menurunkan questionIds dari marketId..."
         )
-        return self._derive_condition_ids_from_market_id(NEG_RISK_MARKET_ID, n=30)
+        return self._derive_condition_ids_from_market_id(NEG_RISK_MARKET_ID, n=MAX_CONDITIONS)
 
     def _derive_condition_ids_from_market_id(
         self, market_id_hex: str, n: int

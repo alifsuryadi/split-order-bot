@@ -522,6 +522,32 @@ class NegRiskSplitBot:
                     _time.sleep(delay * (attempt + 1))
         raise last_exc
 
+    def _wait_receipt(self, tx_hash, timeout: int = 600):
+        """
+        Tunggu receipt TX dengan retry otomatis jika RPC putus koneksi.
+        Jika koneksi terputus (ConnectionResetError / ChunkedEncodingError),
+        coba ulang polling hingga 5 kali dengan jeda 5 detik.
+        TX yang sudah terkirim ke blockchain tetap aman — hanya menunggu konfirmasi.
+        """
+        import time as _t
+        last_exc = None
+        for attempt in range(5):
+            try:
+                return self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            except Exception as exc:
+                err = str(exc)
+                if "Connection" in err or "ConnectionReset" in err or "ChunkedEncoding" in err or "reset by peer" in err:
+                    last_exc = exc
+                    log.warning(
+                        f"[RPC] Koneksi terputus saat menunggu receipt "
+                        f"(attempt {attempt+1}/5). Coba ulang dalam 5 detik..."
+                    )
+                    _t.sleep(5)
+                else:
+                    raise
+        log.error("[RPC] Gagal mendapatkan receipt setelah 5 percobaan.")
+        raise last_exc
+
     def _get_nonce(self) -> int:
         """Ambil nonce wallet — coba pending lalu latest, ambil nilai tertinggi."""
         best = 0
@@ -786,7 +812,7 @@ class NegRiskSplitBot:
         log.info(f"[APPROVE] Polygonscan  : https://polygonscan.com/tx/{tx_hash.hex()}")
         log.info("[APPROVE] Menunggu konfirmasi...")
 
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        receipt = self._wait_receipt(tx_hash, timeout=600)
         if receipt.status != 1:
             raise RuntimeError(
                 f"Transaksi Approve GAGAL (status=0)!\n"
@@ -876,9 +902,7 @@ class NegRiskSplitBot:
                 log.info(f"  TX: https://polygonscan.com/tx/{tx_hash.hex()}")
 
                 # ── Tunggu konfirmasi ─────────────────────────────────────────
-                receipt = self.w3.eth.wait_for_transaction_receipt(
-                    tx_hash, timeout=300
-                )
+                receipt = self._wait_receipt(tx_hash, timeout=300)
                 if receipt.status == 1:
                     log.info(f"  OK  Gas used: {receipt.gasUsed:,}")
                     return tx_hash.hex()
@@ -952,7 +976,7 @@ class NegRiskSplitBot:
         tx_hash = self._signed_send(tx)
         log.info(f"[CTF-APPROVE] TX: https://polygonscan.com/tx/{tx_hash.hex()}")
 
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        receipt = self._wait_receipt(tx_hash, timeout=600)
         if receipt.status != 1:
             raise RuntimeError(f"setApprovalForAll gagal! TX: {tx_hash.hex()}")
 
@@ -1129,7 +1153,7 @@ class NegRiskSplitBot:
                 tx2_hash = self._signed_send(tx2_raw)
                 log.info(f"  TX Convert: https://polygonscan.com/tx/{tx2_hash.hex()}")
 
-                receipt2 = self.w3.eth.wait_for_transaction_receipt(tx2_hash, timeout=600)
+                receipt2 = self._wait_receipt(tx2_hash, timeout=600)
                 if receipt2.status == 1:
                     log.info(f"  OK  Gas used: {receipt2.gasUsed:,}")
                 else:
@@ -1218,7 +1242,7 @@ class NegRiskSplitBot:
         hex_hash = tx_hash.hex()
         log.info(f"  TX: https://polygonscan.com/tx/{hex_hash}")
         log.info("  Menunggu konfirmasi...")
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        receipt = self._wait_receipt(tx_hash, timeout=600)
         if receipt["status"] == 1:
             log.info(f"  OK  Gas used: {receipt['gasUsed']:,}")
         else:
@@ -1302,7 +1326,7 @@ class NegRiskSplitBot:
         log.info(f"[CANCEL] TX: https://polygonscan.com/tx/{hex_hash}")
         log.info("[CANCEL] Menunggu konfirmasi...")
 
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        receipt = self._wait_receipt(tx_hash, timeout=120)
         if receipt["status"] == 1:
             log.info(f"[CANCEL] Berhasil! TX pending dengan nonce {target_nonce} sudah dibatalkan.")
         else:
@@ -1454,7 +1478,7 @@ class NegRiskSplitBot:
                 })
                 tx_hash = self._signed_send(tx)
                 log.info(f"  TX: https://polygonscan.com/tx/{tx_hash.hex()}")
-                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+                receipt = self._wait_receipt(tx_hash, timeout=600)
                 if receipt["status"] == 1:
                     log.info(f"  OK  Gas: {receipt['gasUsed']:,}  → +{amount_raw/1e6:.2f} USDC kembali")
                     success += 1
